@@ -178,7 +178,8 @@ func TestCopyCollectorOverwritesReadOnlyFile(t *testing.T) {
 	destDir := t.TempDir()
 	destPath := filepath.Join(destDir, "objects", "pack", "pack.idx")
 	require.NoError(t, os.MkdirAll(filepath.Dir(destPath), 0o755))
-	require.NoError(t, os.WriteFile(destPath, []byte("old content"), 0o444))
+	require.NoError(t, os.WriteFile(destPath, []byte("old content"), 0o600))
+	require.NoError(t, os.Chmod(destPath, 0o444))
 
 	info, err := os.Stat(destPath)
 	require.NoError(t, err)
