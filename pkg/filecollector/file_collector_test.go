@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -192,4 +193,123 @@ func TestCopyCollectorOverwritesReadOnlyFile(t *testing.T) {
 	info, err = os.Stat(destPath)
 	require.NoError(t, err)
 	assert.Equal(t, fs.FileMode(0o444), info.Mode().Perm())
+}
+
+type fileInfoWithMode struct {
+	fs.FileInfo
+	mode fs.FileMode
+}
+
+func (fi fileInfoWithMode) Mode() fs.FileMode {
+	return fi.mode
+}
+
+func copyCollectorSourceInfo(t *testing.T) fs.FileInfo {
+	t.Helper()
+	sourcePath := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.WriteFile(sourcePath, []byte("source"), 0o600))
+	info, err := os.Stat(sourcePath)
+	require.NoError(t, err)
+	return info
+}
+
+func TestCopyCollectorRejectsPathsOutsideDestination(t *testing.T) {
+	parent := t.TempDir()
+	destDir := filepath.Join(parent, "destination")
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+
+	outsideRelative := filepath.Join("..", "outside-relative")
+	require.Error(t, collector.WriteFile(outsideRelative, info, "", strings.NewReader("new")))
+	_, err := os.Stat(filepath.Join(parent, "outside-relative"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+
+	outsideAbsolute := filepath.Join(parent, "outside-absolute")
+	require.Error(t, collector.WriteFile(outsideAbsolute, info, "", strings.NewReader("new")))
+	_, err = os.Stat(outsideAbsolute)
+	require.ErrorIs(t, err, fs.ErrNotExist)
+}
+
+func TestCopyCollectorRejectsEscapingSymlinkParent(t *testing.T) {
+	parent := t.TempDir()
+	destDir := filepath.Join(parent, "destination")
+	outsideDir := filepath.Join(parent, "outside")
+	require.NoError(t, os.MkdirAll(destDir, 0o755))
+	require.NoError(t, os.MkdirAll(outsideDir, 0o755))
+	if err := os.Symlink(filepath.Join("..", "outside"), filepath.Join(destDir, "pivot")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	collector := &CopyCollector{DstDir: destDir}
+	err := collector.WriteFile(filepath.Join("pivot", "escaped"), copyCollectorSourceInfo(t), "", strings.NewReader("new"))
+	require.Error(t, err)
+	_, err = os.Stat(filepath.Join(outsideDir, "escaped"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+}
+
+func TestCopyCollectorRejectsEscapingSymlinkTarget(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	for _, target := range []string{
+		filepath.Join("..", "..", "outside"),
+		string(filepath.Separator) + "outside",
+	} {
+		err := collector.WriteFile(filepath.Join("nested", "link"), copyCollectorSourceInfo(t), target, nil)
+		require.Error(t, err)
+		_, err = os.Lstat(filepath.Join(destDir, "nested", "link"))
+		require.ErrorIs(t, err, fs.ErrNotExist)
+	}
+}
+
+func TestCopyCollectorSanitizesModeViaOpenFile(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+	untrusted := fileInfoWithMode{
+		FileInfo: info,
+		mode:     fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky | 0o777,
+	}
+	require.NoError(t, collector.WriteFile("copied", untrusted, "", strings.NewReader("new")))
+
+	copied, err := os.Stat(filepath.Join(destDir, "copied"))
+	require.NoError(t, err)
+	assert.Zero(t, copied.Mode()&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky))
+	if runtime.GOOS != "windows" {
+		assert.Equal(t, fs.FileMode(0o755), copied.Mode().Perm())
+	}
+}
+
+func TestCopyCollectorReplacesLeafSymlinkWithoutFollowingIt(t *testing.T) {
+	parent := t.TempDir()
+	destDir := filepath.Join(parent, "destination")
+	require.NoError(t, os.MkdirAll(destDir, 0o755))
+	outsidePath := filepath.Join(parent, "outside")
+	require.NoError(t, os.WriteFile(outsidePath, []byte("outside"), 0o600))
+	if err := os.Symlink(outsidePath, filepath.Join(destDir, "copied")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	collector := &CopyCollector{DstDir: destDir}
+	require.NoError(t, collector.WriteFile("copied", copyCollectorSourceInfo(t), "", strings.NewReader("new")))
+	content, err := os.ReadFile(outsidePath)
+	require.NoError(t, err)
+	assert.Equal(t, "outside", string(content))
+	content, err = os.ReadFile(filepath.Join(destDir, "copied"))
+	require.NoError(t, err)
+	assert.Equal(t, "new", string(content))
+	info, err := os.Lstat(filepath.Join(destDir, "copied"))
+	require.NoError(t, err)
+	assert.True(t, info.Mode().IsRegular())
+}
+
+func TestCopyCollectorDoesNotReplaceDirectory(t *testing.T) {
+	destDir := t.TempDir()
+	destPath := filepath.Join(destDir, "copied")
+	require.NoError(t, os.Mkdir(destPath, 0o700))
+
+	collector := &CopyCollector{DstDir: destDir}
+	require.Error(t, collector.WriteFile("copied", copyCollectorSourceInfo(t), "", strings.NewReader("new")))
+	info, err := os.Stat(destPath)
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
 }

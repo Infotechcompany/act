@@ -3,6 +3,8 @@ package filecollector
 import (
 	"archive/tar"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -64,41 +66,136 @@ type CopyCollector struct {
 	DstDir string
 }
 
-func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
-	fdestpath := filepath.Join(cc.DstDir, fpath)
-	if err := os.MkdirAll(filepath.Dir(fdestpath), 0o777); err != nil {
-		return err
-	}
-	if existing, err := os.Lstat(fdestpath); err == nil {
-		// go-git stores pack files read-only. Make regular files removable on
-		// platforms where the read-only bit prevents deletion, but do not follow
-		// an existing symlink.
-		if existing.Mode().IsRegular() {
-			if err := os.Chmod(fdestpath, 0o600); err != nil {
-				return err
-			}
+func createRootTempFile(root *os.Root) (*os.File, string, error) {
+	var random [16]byte
+	for range 100 {
+		if _, err := rand.Read(random[:]); err != nil {
+			return nil, "", err
 		}
-		if err := os.Remove(fdestpath); err != nil {
-			return err
+		name := ".act-copy-" + hex.EncodeToString(random[:])
+		f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			return f, name, nil
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, "", err
+		}
 	}
-	if linkName != "" {
-		return os.Symlink(linkName, fdestpath)
+	return nil, "", fmt.Errorf("unable to create temporary copy file")
+}
+
+func replaceRootEntry(root *os.Root, tempName, destName string) error {
+	renameErr := root.Rename(tempName, destName)
+	if renameErr == nil {
+		return nil
 	}
-	df, err := os.OpenFile(fdestpath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode())
+	existing, statErr := root.Lstat(destName)
+	if errors.Is(statErr, fs.ErrNotExist) {
+		return renameErr
+	} else if statErr != nil {
+		return statErr
+	}
+	if !existing.Mode().IsRegular() && existing.Mode()&fs.ModeSymlink == 0 {
+		return renameErr
+	}
+	if !errors.Is(renameErr, fs.ErrExist) && !errors.Is(renameErr, fs.ErrPermission) {
+		return renameErr
+	}
+
+	// Windows cannot rename over some existing entries. Move the original to a
+	// same-directory backup first, so an unexpected installation failure can be
+	// rolled back without path-based chmod or deletion.
+	backup, backupName, err := createRootTempFile(root)
 	if err != nil {
 		return err
 	}
+	if err := backup.Close(); err != nil {
+		_ = root.Remove(backupName)
+		return err
+	}
+	if err := root.Remove(backupName); err != nil {
+		return err
+	}
+	if err := root.Rename(destName, backupName); err != nil {
+		return err
+	}
+	if err := root.Rename(tempName, destName); err != nil {
+		if rollbackErr := root.Rename(backupName, destName); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore original destination: %w", rollbackErr))
+		}
+		return err
+	}
+	return root.Remove(backupName)
+}
+
+func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
+	if !filepath.IsLocal(fpath) || filepath.Clean(fpath) == "." {
+		return fmt.Errorf("copy destination %q is not a local path", fpath)
+	}
+	fpath = filepath.Clean(fpath)
+	if err := os.MkdirAll(cc.DstDir, 0o755); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(cc.DstDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	parentName := filepath.Dir(fpath)
+	if err := root.MkdirAll(parentName, 0o755); err != nil {
+		return err
+	}
+	parent, err := root.OpenRoot(parentName)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+
+	destName := filepath.Base(fpath)
+	if linkName != "" {
+		if filepath.IsAbs(linkName) || filepath.VolumeName(linkName) != "" || os.IsPathSeparator(linkName[0]) ||
+			!filepath.IsLocal(filepath.Join(parentName, linkName)) {
+			return fmt.Errorf("symlink target %q escapes copy destination", linkName)
+		}
+		tempFile, tempName, err := createRootTempFile(parent)
+		if err != nil {
+			return err
+		}
+		if err := tempFile.Close(); err != nil {
+			_ = parent.Remove(tempName)
+			return err
+		}
+		if err := parent.Remove(tempName); err != nil {
+			return err
+		}
+		if err := parent.Symlink(linkName, tempName); err != nil {
+			return err
+		}
+		defer func() { _ = parent.Remove(tempName) }()
+		return replaceRootEntry(parent, tempName, destName)
+	}
+
+	df, tempName, err := createRootTempFile(parent)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Remove(tempName) }()
 	if _, err := io.Copy(df, f); err != nil {
+		_ = df.Close()
+		return err
+	}
+	// Preserve read/execute intent while stripping special and group/other
+	// write bits from untrusted archive modes. Apply it via the open descriptor
+	// so a path substitution cannot redirect chmod.
+	if err := df.Chmod(fi.Mode().Perm() & 0o755); err != nil {
 		_ = df.Close()
 		return err
 	}
 	if err := df.Close(); err != nil {
 		return err
 	}
-	return os.Chmod(fdestpath, fi.Mode())
+	return replaceRootEntry(parent, tempName, destName)
 }
 
 type FileCollector struct {
