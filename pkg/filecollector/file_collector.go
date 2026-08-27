@@ -85,19 +85,21 @@ func createRootTempFile(root *os.Root) (*os.File, string, error) {
 	return nil, "", fmt.Errorf("unable to create temporary copy file")
 }
 
-func rollbackBackupCleanup(root *os.Root, tempName, destName, backupName string, cleanupErr error) error {
+func rollbackBackupCleanup(root *os.Root, tempName, destName, backupName string, originalMode fs.FileMode, cleanupErr error) error {
 	if err := root.Rename(destName, tempName); err != nil {
-		return errors.Join(cleanupErr, fmt.Errorf("move replacement aside for rollback: %w", err))
+		return errors.Join(cleanupErr, fmt.Errorf("move replacement aside for rollback: %w", err),
+			restoreRootEntryMode(root, backupName, originalMode))
 	}
 	if restoreErr := root.Rename(backupName, destName); restoreErr != nil {
 		reinstallErr := root.Rename(tempName, destName)
+		modeErr := restoreRootEntryMode(root, backupName, originalMode)
 		if reinstallErr != nil {
 			return errors.Join(cleanupErr, fmt.Errorf("restore original destination: %w", restoreErr),
-				fmt.Errorf("reinstall replacement after failed rollback: %w", reinstallErr))
+				fmt.Errorf("reinstall replacement after failed rollback: %w", reinstallErr), modeErr)
 		}
-		return errors.Join(cleanupErr, fmt.Errorf("restore original destination: %w", restoreErr))
+		return errors.Join(cleanupErr, fmt.Errorf("restore original destination: %w", restoreErr), modeErr)
 	}
-	return cleanupErr
+	return errors.Join(cleanupErr, restoreRootEntryMode(root, destName, originalMode))
 }
 
 func replaceRootEntry(root *os.Root, tempName, destName string) error {
@@ -143,8 +145,11 @@ func replaceRootEntry(root *os.Root, tempName, destName string) error {
 		}
 		return err
 	}
+	if cleanupErr := prepareRootBackupRemoval(root, backupName, existing.Mode()); cleanupErr != nil {
+		return rollbackBackupCleanup(root, tempName, destName, backupName, existing.Mode(), cleanupErr)
+	}
 	if cleanupErr := root.Remove(backupName); cleanupErr != nil {
-		return rollbackBackupCleanup(root, tempName, destName, backupName, cleanupErr)
+		return rollbackBackupCleanup(root, tempName, destName, backupName, existing.Mode(), cleanupErr)
 	}
 	return nil
 }
@@ -192,10 +197,83 @@ func writeRootSymlink(root, parent *os.Root, parentName, destName, linkName stri
 	defer func() { _ = parent.Remove(tempName) }()
 	// Reject links that currently resolve outside the root. A dangling link is
 	// revalidated by Finalize after every archive entry has been installed.
-	if _, err := root.Stat(filepath.Join(parentName, tempName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if _, err := resolveRootPath(root, filepath.Join(parentName, tempName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("validate symlink target %q: %w", linkName, err)
 	}
 	return replaceRootEntry(parent, tempName, destName)
+}
+
+func splitPathComponents(name string) []string {
+	return strings.FieldsFunc(name, func(r rune) bool {
+		return r <= 0xff && os.IsPathSeparator(uint8(r))
+	})
+}
+
+// resolveRootPath resolves one symlink at a time so confinement validation is
+// not limited by os.Root's conservative eight-symlink traversal cap. Every
+// Lstat and Readlink receives a path whose parent components have already been
+// proven to be real directories beneath root.
+func resolveRootPath(root *os.Root, name string) (fs.FileInfo, error) {
+	if !filepath.IsLocal(name) || filepath.Clean(name) == "." {
+		return nil, fmt.Errorf("path %q is not local", name)
+	}
+
+	remaining := splitPathComponents(name)
+	resolved := make([]string, 0, len(remaining))
+	const maxSymlinkTraversals = 255
+	traversedSymlinks := 0
+
+	for len(remaining) > 0 {
+		component := remaining[0]
+		remaining = remaining[1:]
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return nil, fmt.Errorf("path %q escapes root", name)
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
+		}
+
+		candidate := component
+		if len(resolved) > 0 {
+			candidate = filepath.Join(filepath.Join(resolved...), component)
+		}
+		info, err := root.Lstat(candidate)
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			resolved = append(resolved, component)
+			if len(remaining) > 0 && !info.IsDir() {
+				return nil, fmt.Errorf("path component %q is not a directory", candidate)
+			}
+			if len(remaining) == 0 {
+				return info, nil
+			}
+			continue
+		}
+
+		traversedSymlinks++
+		if traversedSymlinks > maxSymlinkTraversals {
+			return nil, fmt.Errorf("path %q exceeds %d symlink traversals", name, maxSymlinkTraversals)
+		}
+		target, err := root.Readlink(candidate)
+		if err != nil {
+			return nil, err
+		}
+		if target == "" || filepath.IsAbs(target) || filepath.VolumeName(target) != "" || os.IsPathSeparator(target[0]) {
+			return nil, fmt.Errorf("symlink target %q escapes root", target)
+		}
+		remaining = append(splitPathComponents(target), remaining...)
+	}
+
+	if len(resolved) == 0 {
+		return root.Lstat(".")
+	}
+	return root.Lstat(filepath.Join(resolved...))
 }
 
 func (cc *CopyCollector) Finalize() error {
@@ -222,7 +300,7 @@ func (cc *CopyCollector) Finalize() error {
 			delete(cc.symlinkPaths, name)
 			continue
 		}
-		if _, err := root.Stat(name); err != nil {
+		if _, err := resolveRootPath(root, name); err != nil {
 			removeErr := root.Remove(name)
 			validationErr = errors.Join(validationErr,
 				fmt.Errorf("copied symlink %q is not confined after copy: %w", name, err),

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -338,6 +339,23 @@ func TestCopyCollectorAllowsLeadingParentSymlinksWithinRoot(t *testing.T) {
 	assert.Equal(t, "root", string(content))
 }
 
+func TestCopyCollectorAllowsLongConfinedSymlinkChain(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+
+	for i := 0; i < 9; i++ {
+		require.NoError(t, collector.WriteFile(fmt.Sprintf("link-%d", i), info, fmt.Sprintf("link-%d", i+1), nil))
+	}
+	require.NoError(t, collector.WriteFile("link-9", info, "target", nil))
+	require.NoError(t, collector.WriteFile("target", info, "", strings.NewReader("confined")))
+	require.NoError(t, collector.Finalize())
+
+	content, err := os.ReadFile(filepath.Join(destDir, "link-0"))
+	require.NoError(t, err)
+	assert.Equal(t, "confined", string(content))
+}
+
 func TestCopyCollectorFinalizeRejectsDanglingSymlink(t *testing.T) {
 	destDir := t.TempDir()
 	collector := &CopyCollector{DstDir: destDir}
@@ -451,7 +469,7 @@ func TestRollbackAfterBackupCleanupFailure(t *testing.T) {
 	require.NoError(t, os.Chmod(filepath.Join(destDir, "backup"), 0o444))
 
 	cleanupErr := errors.New("injected backup cleanup failure")
-	err = rollbackBackupCleanup(root, "temporary", "destination", "backup", cleanupErr)
+	err = rollbackBackupCleanup(root, "temporary", "destination", "backup", fs.FileMode(0o444), cleanupErr)
 	require.ErrorIs(t, err, cleanupErr)
 	content, err := os.ReadFile(filepath.Join(destDir, "destination"))
 	require.NoError(t, err)

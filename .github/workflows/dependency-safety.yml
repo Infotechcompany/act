@@ -82,4 +82,6 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Test read-only replacement and rollback
         shell: bash
-        run: go test -count=1 ./pkg/filecollector -run '^(TestCopyCollectorOverwritesReadOnlyFile|TestRollbackAfterBackupCleanupFailure)$'
+        run: |
+          go test -count=1 ./pkg/filecollector -run '^(TestCopyCollectorOverwritesReadOnlyFile|TestPrepareRootBackupRemovalClearsReadOnly|TestRollbackAfterBackupCleanupFailure)$'
+          go test -count=1 ./pkg/container -run '^TestCopyDirOverwritesReadOnlyGitPack$'
