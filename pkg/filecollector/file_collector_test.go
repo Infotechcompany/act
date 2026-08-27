@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"context"
 	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/index"
 	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type memoryFs struct {
@@ -169,4 +172,23 @@ func TestSymlinks(t *testing.T) {
 	assert.Equal(t, "test.env", files["test.env"].Name)
 	assert.Equal(t, ".env", files["test.env"].Linkname)
 	assert.ErrorIs(t, err, io.EOF, "tar must be read cleanly to EOF")
+}
+
+func TestCopyCollectorOverwritesReadOnlyFile(t *testing.T) {
+	destDir := t.TempDir()
+	destPath := filepath.Join(destDir, "objects", "pack", "pack.idx")
+	require.NoError(t, os.MkdirAll(filepath.Dir(destPath), 0o755))
+	require.NoError(t, os.WriteFile(destPath, []byte("old content"), 0o444))
+
+	info, err := os.Stat(destPath)
+	require.NoError(t, err)
+	collector := &CopyCollector{DstDir: destDir}
+	require.NoError(t, collector.WriteFile(filepath.Join("objects", "pack", "pack.idx"), info, "", strings.NewReader("new")))
+
+	content, err := os.ReadFile(destPath)
+	require.NoError(t, err)
+	assert.Equal(t, "new", string(content))
+	info, err = os.Stat(destPath)
+	require.NoError(t, err)
+	assert.Equal(t, fs.FileMode(0o444), info.Mode().Perm())
 }

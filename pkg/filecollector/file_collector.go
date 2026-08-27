@@ -3,6 +3,7 @@ package filecollector
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -68,18 +69,36 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 	if err := os.MkdirAll(filepath.Dir(fdestpath), 0o777); err != nil {
 		return err
 	}
+	if existing, err := os.Lstat(fdestpath); err == nil {
+		// go-git stores pack files read-only. Make regular files removable on
+		// platforms where the read-only bit prevents deletion, but do not follow
+		// an existing symlink.
+		if existing.Mode().IsRegular() {
+			if err := os.Chmod(fdestpath, 0o600); err != nil {
+				return err
+			}
+		}
+		if err := os.Remove(fdestpath); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if linkName != "" {
 		return os.Symlink(linkName, fdestpath)
 	}
-	df, err := os.OpenFile(fdestpath, os.O_CREATE|os.O_WRONLY, fi.Mode())
+	df, err := os.OpenFile(fdestpath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode())
 	if err != nil {
 		return err
 	}
-	defer df.Close()
 	if _, err := io.Copy(df, f); err != nil {
+		_ = df.Close()
 		return err
 	}
-	return nil
+	if err := df.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(fdestpath, fi.Mode())
 }
 
 type FileCollector struct {
