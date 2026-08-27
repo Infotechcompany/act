@@ -35,6 +35,9 @@ jobs:
   test-linux:
     name: test-linux
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -78,7 +81,7 @@ jobs:
         with:
           files: coverage.txt
           fail_ci_if_error: true # optional (default = false)
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           version: v11.3.1
 
   test-host:
