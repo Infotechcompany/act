@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Type assert HostEnvironment implements ExecutionsEnvironment
@@ -52,6 +54,54 @@ func TestCopyDir(t *testing.T) {
 	_ = os.MkdirAll(e.ActPath, 0700)
 	err = e.CopyDir(e.Workdir, e.Path, true)(ctx)
 	assert.NoError(t, err)
+}
+
+func TestCopyDirOverwritesReadOnlyGitPack(t *testing.T) {
+	srcDir := t.TempDir()
+	destDir := t.TempDir()
+	relativePack := filepath.Join(".git", "objects", "pack", "pack-test.idx")
+	srcPack := filepath.Join(srcDir, relativePack)
+	// CopyDir preserves the source directory's base name beneath destDir.
+	destPack := filepath.Join(destDir, filepath.Base(srcDir), relativePack)
+	require.NoError(t, os.MkdirAll(filepath.Dir(srcPack), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(destPack), 0o755))
+	require.NoError(t, os.WriteFile(srcPack, []byte("new pack index"), 0o600))
+	require.NoError(t, os.Chmod(srcPack, 0o444))
+	require.NoError(t, os.WriteFile(destPack, []byte("old pack index"), 0o600))
+	require.NoError(t, os.Chmod(destPack, 0o444))
+
+	err := (&HostEnvironment{}).CopyDir(destDir, srcDir, false)(context.Background())
+	require.NoError(t, err)
+	content, err := os.ReadFile(destPack)
+	require.NoError(t, err)
+	assert.Equal(t, "new pack index", string(content))
+	info, err := os.Stat(destPack)
+	require.NoError(t, err)
+	assert.Equal(t, fs.FileMode(0o444), info.Mode().Perm())
+	backups, err := filepath.Glob(filepath.Join(filepath.Dir(destPack), ".act-copy-*"))
+	require.NoError(t, err)
+	assert.Empty(t, backups)
+}
+
+func TestCopyDirPreservesLongConfinedSymlinkChain(t *testing.T) {
+	srcDir := t.TempDir()
+	destDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(srcDir, "target"), []byte("confined"), 0o600))
+	for i := 9; i >= 0; i-- {
+		target := "target"
+		if i < 9 {
+			target = fmt.Sprintf("link-%d", i+1)
+		}
+		if err := os.Symlink(target, filepath.Join(srcDir, fmt.Sprintf("link-%d", i))); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+
+	err := (&HostEnvironment{}).CopyDir(destDir, srcDir, false)(context.Background())
+	require.NoError(t, err)
+	content, err := os.ReadFile(filepath.Join(destDir, filepath.Base(srcDir), "link-0"))
+	require.NoError(t, err)
+	assert.Equal(t, "confined", string(content))
 }
 
 func TestGetContainerArchive(t *testing.T) {
