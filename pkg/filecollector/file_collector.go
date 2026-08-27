@@ -63,7 +63,8 @@ func (tc TarCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, 
 }
 
 type CopyCollector struct {
-	DstDir string
+	DstDir       string
+	symlinkPaths map[string]struct{}
 }
 
 func createRootTempFile(root *os.Root) (*os.File, string, error) {
@@ -198,8 +199,8 @@ func writeRootSymlink(root, parent *os.Root, parentName, destName, linkName stri
 }
 
 func (cc *CopyCollector) Finalize() error {
-	if err := os.MkdirAll(cc.DstDir, 0o755); err != nil {
-		return err
+	if len(cc.symlinkPaths) == 0 {
+		return nil
 	}
 	root, err := os.OpenRoot(cc.DstDir)
 	if err != nil {
@@ -208,27 +209,32 @@ func (cc *CopyCollector) Finalize() error {
 	defer root.Close()
 
 	var validationErr error
-	walkErr := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
+	for name := range cc.symlinkPaths {
+		info, err := root.Lstat(name)
+		if errors.Is(err, fs.ErrNotExist) {
+			delete(cc.symlinkPaths, name)
+			continue
+		} else if err != nil {
+			validationErr = errors.Join(validationErr, fmt.Errorf("inspect copied symlink %q: %w", name, err))
+			continue
 		}
 		if info.Mode()&fs.ModeSymlink == 0 {
-			return nil
+			delete(cc.symlinkPaths, name)
+			continue
 		}
-		rootName := filepath.FromSlash(name)
-		if _, err := root.Stat(rootName); err != nil {
-			removeErr := root.Remove(rootName)
+		if _, err := root.Stat(name); err != nil {
+			removeErr := root.Remove(name)
 			validationErr = errors.Join(validationErr,
-				fmt.Errorf("symlink %q is not confined after copy: %w", name, err),
+				fmt.Errorf("copied symlink %q is not confined after copy: %w", name, err),
 				removeErr)
+			if removeErr == nil {
+				delete(cc.symlinkPaths, name)
+			}
+		} else {
+			delete(cc.symlinkPaths, name)
 		}
-		return nil
-	})
-	return errors.Join(walkErr, validationErr)
+	}
+	return validationErr
 }
 
 func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
@@ -260,7 +266,14 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 
 	destName := filepath.Base(fpath)
 	if linkName != "" {
-		return writeRootSymlink(root, parent, parentName, destName, linkName)
+		if err := writeRootSymlink(root, parent, parentName, destName, linkName); err != nil {
+			return err
+		}
+		if cc.symlinkPaths == nil {
+			cc.symlinkPaths = make(map[string]struct{})
+		}
+		cc.symlinkPaths[fpath] = struct{}{}
+		return nil
 	}
 
 	df, tempName, err := createRootTempFile(parent)
@@ -282,7 +295,11 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 	if err := df.Close(); err != nil {
 		return err
 	}
-	return replaceRootEntry(parent, tempName, destName)
+	if err := replaceRootEntry(parent, tempName, destName); err != nil {
+		return err
+	}
+	delete(cc.symlinkPaths, fpath)
+	return nil
 }
 
 type FileCollector struct {

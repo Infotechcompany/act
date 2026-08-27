@@ -347,6 +347,27 @@ func TestCopyCollectorFinalizeRejectsDanglingSymlink(t *testing.T) {
 	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
+func TestCopyCollectorFinalizeLeavesUnrelatedDestinationSymlink(t *testing.T) {
+	parent := t.TempDir()
+	destDir := filepath.Join(parent, "destination")
+	require.NoError(t, os.MkdirAll(destDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(parent, "unrelated-outside"), []byte("unrelated"), 0o600))
+	if err := os.Symlink(filepath.Join("..", "unrelated-outside"), filepath.Join(destDir, "unrelated")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+	require.NoError(t, collector.WriteFile("b", info, strings.Join([]string{"a", "..", "outside"}, string(filepath.Separator)), nil))
+	require.NoError(t, collector.WriteFile("a", info, ".", nil))
+	require.Error(t, collector.Finalize())
+	_, err := os.Lstat(filepath.Join(destDir, "b"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	unrelated, err := os.Lstat(filepath.Join(destDir, "unrelated"))
+	require.NoError(t, err)
+	assert.NotZero(t, unrelated.Mode()&fs.ModeSymlink)
+}
+
 func TestCopyCollectorSanitizesModeViaOpenFile(t *testing.T) {
 	destDir := t.TempDir()
 	collector := &CopyCollector{DstDir: destDir}
