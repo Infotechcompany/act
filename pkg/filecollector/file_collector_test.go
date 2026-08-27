@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -247,6 +248,21 @@ func TestCopyCollectorRejectsEscapingSymlinkParent(t *testing.T) {
 	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
+func TestCopyCollectorRejectsInRootSymlinkParentAlias(t *testing.T) {
+	parent := t.TempDir()
+	destDir := filepath.Join(parent, "destination")
+	require.NoError(t, os.MkdirAll(filepath.Join(destDir, "b"), 0o755))
+	if err := os.Symlink(".", filepath.Join(destDir, "a")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	collector := &CopyCollector{DstDir: destDir}
+	err := collector.WriteFile(filepath.Join("a", "b", "link"), copyCollectorSourceInfo(t), filepath.Join("..", "..", "outside"), nil)
+	require.Error(t, err)
+	_, err = os.Lstat(filepath.Join(destDir, "b", "link"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+}
+
 func TestCopyCollectorRejectsEscapingSymlinkTarget(t *testing.T) {
 	destDir := t.TempDir()
 	collector := &CopyCollector{DstDir: destDir}
@@ -312,4 +328,23 @@ func TestCopyCollectorDoesNotReplaceDirectory(t *testing.T) {
 	info, err := os.Stat(destPath)
 	require.NoError(t, err)
 	assert.True(t, info.IsDir())
+}
+
+func TestCopyCollectorDoesNotReplaceSpecialFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are not available on Windows")
+	}
+	destDir := t.TempDir()
+	destPath := filepath.Join(destDir, "copied")
+	listener, err := net.Listen("unix", destPath)
+	if err != nil {
+		t.Skipf("Unix sockets unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	collector := &CopyCollector{DstDir: destDir}
+	require.Error(t, collector.WriteFile("copied", copyCollectorSourceInfo(t), "", strings.NewReader("new")))
+	info, err := os.Lstat(destPath)
+	require.NoError(t, err)
+	assert.NotZero(t, info.Mode()&fs.ModeSocket)
 }

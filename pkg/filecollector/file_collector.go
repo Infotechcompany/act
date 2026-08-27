@@ -85,18 +85,19 @@ func createRootTempFile(root *os.Root) (*os.File, string, error) {
 }
 
 func replaceRootEntry(root *os.Root, tempName, destName string) error {
-	renameErr := root.Rename(tempName, destName)
-	if renameErr == nil {
-		return nil
-	}
 	existing, statErr := root.Lstat(destName)
 	if errors.Is(statErr, fs.ErrNotExist) {
-		return renameErr
+		return root.Rename(tempName, destName)
 	} else if statErr != nil {
 		return statErr
 	}
 	if !existing.Mode().IsRegular() && existing.Mode()&fs.ModeSymlink == 0 {
-		return renameErr
+		return fmt.Errorf("refusing to replace non-file destination %q", destName)
+	}
+
+	renameErr := root.Rename(tempName, destName)
+	if renameErr == nil {
+		return nil
 	}
 	if !errors.Is(renameErr, fs.ErrExist) && !errors.Is(renameErr, fs.ErrPermission) {
 		return renameErr
@@ -128,6 +129,27 @@ func replaceRootEntry(root *os.Root, tempName, destName string) error {
 	return root.Remove(backupName)
 }
 
+func ensureNoSymlinkParents(root *os.Root, parentName string) error {
+	if parentName == "." {
+		return nil
+	}
+	prefix := ""
+	for _, component := range strings.Split(parentName, string(filepath.Separator)) {
+		prefix = filepath.Join(prefix, component)
+		info, err := root.Lstat(prefix)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("copy destination parent %q is a symlink", prefix)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("copy destination parent %q is not a directory", prefix)
+		}
+	}
+	return nil
+}
+
 func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
 	if !filepath.IsLocal(fpath) || filepath.Clean(fpath) == "." {
 		return fmt.Errorf("copy destination %q is not a local path", fpath)
@@ -144,6 +166,9 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 
 	parentName := filepath.Dir(fpath)
 	if err := root.MkdirAll(parentName, 0o755); err != nil {
+		return err
+	}
+	if err := ensureNoSymlinkParents(root, parentName); err != nil {
 		return err
 	}
 	parent, err := root.OpenRoot(parentName)
@@ -173,6 +198,12 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 			return err
 		}
 		defer func() { _ = parent.Remove(tempName) }()
+		// Resolve the link through the original root as a final confinement
+		// check. ErrNotExist is safe for a dangling link, while an escaping
+		// target produces a distinct os.Root traversal error.
+		if _, err := root.Stat(filepath.Join(parentName, tempName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("validate symlink target %q: %w", linkName, err)
+		}
 		return replaceRootEntry(parent, tempName, destName)
 	}
 
