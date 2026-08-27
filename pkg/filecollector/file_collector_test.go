@@ -272,8 +272,6 @@ func TestCopyCollectorRejectsEscapingSymlinkTarget(t *testing.T) {
 	collector := &CopyCollector{DstDir: destDir}
 	for _, target := range []string{
 		filepath.Join("..", "..", "outside"),
-		strings.Join([]string{"a", "..", "outside"}, string(filepath.Separator)),
-		"a\\..\\outside",
 		string(filepath.Separator) + "outside",
 	} {
 		err := collector.WriteFile(filepath.Join("nested", "link"), copyCollectorSourceInfo(t), target, nil)
@@ -290,11 +288,10 @@ func TestCopyCollectorRejectsReverseOrderedSymlinkEscape(t *testing.T) {
 
 	// The first link is dangling at creation time. A later `a -> .` entry used
 	// to make its cleaned target resolve above DstDir.
-	require.Error(t, collector.WriteFile("b", info, strings.Join([]string{"a", "..", "outside"}, string(filepath.Separator)), nil))
-	_, err := os.Lstat(filepath.Join(destDir, "b"))
-	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.NoError(t, collector.WriteFile("b", info, strings.Join([]string{"a", "..", "outside"}, string(filepath.Separator)), nil))
 	require.NoError(t, collector.WriteFile("a", info, ".", nil))
-	_, err = os.Lstat(filepath.Join(destDir, "b"))
+	require.Error(t, collector.Finalize())
+	_, err := os.Lstat(filepath.Join(destDir, "b"))
 	require.ErrorIs(t, err, fs.ErrNotExist)
 
 	// The same invariant holds when safe aliases are created first or chained.
@@ -313,9 +310,41 @@ func TestCopyCollectorAllowsSafeForwardSymlink(t *testing.T) {
 	info := copyCollectorSourceInfo(t)
 	require.NoError(t, collector.WriteFile("link", info, "not-created-yet", nil))
 	require.NoError(t, collector.WriteFile("not-created-yet", info, "", strings.NewReader("created later")))
+	require.NoError(t, collector.Finalize())
 	content, err := os.ReadFile(filepath.Join(destDir, "link"))
 	require.NoError(t, err)
 	assert.Equal(t, "created later", string(content))
+}
+
+func TestCopyCollectorAllowsLeadingParentSymlinksWithinRoot(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+
+	binLink := filepath.Join("node_modules", ".bin", "ncc")
+	binTarget := filepath.Join("..", "@vercel", "ncc", "dist", "ncc", "cli.js")
+	require.NoError(t, collector.WriteFile(binLink, info, binTarget, nil))
+	require.NoError(t, collector.WriteFile(filepath.Join("node_modules", "@vercel", "ncc", "dist", "ncc", "cli.js"), info, "", strings.NewReader("ncc")))
+
+	require.NoError(t, collector.WriteFile(filepath.Join("deep", "nested", "link"), info, filepath.Join("..", "..", "root-file"), nil))
+	require.NoError(t, collector.WriteFile("root-file", info, "", strings.NewReader("root")))
+	require.NoError(t, collector.Finalize())
+
+	content, err := os.ReadFile(filepath.Join(destDir, binLink))
+	require.NoError(t, err)
+	assert.Equal(t, "ncc", string(content))
+	content, err = os.ReadFile(filepath.Join(destDir, "deep", "nested", "link"))
+	require.NoError(t, err)
+	assert.Equal(t, "root", string(content))
+}
+
+func TestCopyCollectorFinalizeRejectsDanglingSymlink(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	require.NoError(t, collector.WriteFile("link", copyCollectorSourceInfo(t), "not-created", nil))
+	require.Error(t, collector.Finalize())
+	_, err := os.Lstat(filepath.Join(destDir, "link"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
 }
 
 func TestCopyCollectorSanitizesModeViaOpenFile(t *testing.T) {
@@ -395,8 +424,10 @@ func TestRollbackAfterBackupCleanupFailure(t *testing.T) {
 	root, err := os.OpenRoot(destDir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = root.Close() })
-	require.NoError(t, os.WriteFile(filepath.Join(destDir, "destination"), []byte("new"), 0o444))
-	require.NoError(t, os.WriteFile(filepath.Join(destDir, "backup"), []byte("old"), 0o444))
+	require.NoError(t, os.WriteFile(filepath.Join(destDir, "destination"), []byte("new"), 0o600))
+	require.NoError(t, os.Chmod(filepath.Join(destDir, "destination"), 0o444))
+	require.NoError(t, os.WriteFile(filepath.Join(destDir, "backup"), []byte("old"), 0o600))
+	require.NoError(t, os.Chmod(filepath.Join(destDir, "backup"), 0o444))
 
 	cleanupErr := errors.New("injected backup cleanup failure")
 	err = rollbackBackupCleanup(root, "temporary", "destination", "backup", cleanupErr)

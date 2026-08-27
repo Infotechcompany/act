@@ -169,13 +169,66 @@ func ensureNoSymlinkParents(root *os.Root, parentName string) error {
 	return nil
 }
 
-func hasParentPathComponent(name string) bool {
-	for _, component := range strings.FieldsFunc(name, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if component == ".." {
-			return true
-		}
+func writeRootSymlink(root, parent *os.Root, parentName, destName, linkName string) error {
+	if filepath.IsAbs(linkName) || filepath.VolumeName(linkName) != "" || os.IsPathSeparator(linkName[0]) ||
+		!filepath.IsLocal(filepath.Join(parentName, linkName)) {
+		return fmt.Errorf("symlink target %q escapes copy destination", linkName)
 	}
-	return false
+	tempFile, tempName, err := createRootTempFile(parent)
+	if err != nil {
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		_ = parent.Remove(tempName)
+		return err
+	}
+	if err := parent.Remove(tempName); err != nil {
+		return err
+	}
+	if err := parent.Symlink(linkName, tempName); err != nil {
+		return err
+	}
+	defer func() { _ = parent.Remove(tempName) }()
+	// Reject links that currently resolve outside the root. A dangling link is
+	// revalidated by Finalize after every archive entry has been installed.
+	if _, err := root.Stat(filepath.Join(parentName, tempName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("validate symlink target %q: %w", linkName, err)
+	}
+	return replaceRootEntry(parent, tempName, destName)
+}
+
+func (cc *CopyCollector) Finalize() error {
+	if err := os.MkdirAll(cc.DstDir, 0o755); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(cc.DstDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+
+	var validationErr error
+	walkErr := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			return nil
+		}
+		rootName := filepath.FromSlash(name)
+		if _, err := root.Stat(rootName); err != nil {
+			removeErr := root.Remove(rootName)
+			validationErr = errors.Join(validationErr,
+				fmt.Errorf("symlink %q is not confined after copy: %w", name, err),
+				removeErr)
+		}
+		return nil
+	})
+	return errors.Join(walkErr, validationErr)
 }
 
 func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
@@ -207,32 +260,7 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 
 	destName := filepath.Base(fpath)
 	if linkName != "" {
-		if filepath.IsAbs(linkName) || filepath.VolumeName(linkName) != "" || os.IsPathSeparator(linkName[0]) ||
-			hasParentPathComponent(linkName) || !filepath.IsLocal(filepath.Join(parentName, linkName)) {
-			return fmt.Errorf("symlink target %q escapes copy destination", linkName)
-		}
-		tempFile, tempName, err := createRootTempFile(parent)
-		if err != nil {
-			return err
-		}
-		if err := tempFile.Close(); err != nil {
-			_ = parent.Remove(tempName)
-			return err
-		}
-		if err := parent.Remove(tempName); err != nil {
-			return err
-		}
-		if err := parent.Symlink(linkName, tempName); err != nil {
-			return err
-		}
-		defer func() { _ = parent.Remove(tempName) }()
-		// Resolve the link through the original root as a final confinement
-		// check. ErrNotExist is safe for a dangling link, while an escaping
-		// target produces a distinct os.Root traversal error.
-		if _, err := root.Stat(filepath.Join(parentName, tempName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("validate symlink target %q: %w", linkName, err)
-		}
-		return replaceRootEntry(parent, tempName, destName)
+		return writeRootSymlink(root, parent, parentName, destName, linkName)
 	}
 
 	df, tempName, err := createRootTempFile(parent)
