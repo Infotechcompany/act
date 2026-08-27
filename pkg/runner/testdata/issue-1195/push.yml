@@ -10,4 +10,4 @@ jobs:
       - name: print env.variable
         run: |
           echo ${{ env.variable }}
-          test "${{ env.variable }}" = "$ACT_OWNER"
+          test "${{ env.variable }}" = "$GITHUB_REPOSITORY_OWNER"
