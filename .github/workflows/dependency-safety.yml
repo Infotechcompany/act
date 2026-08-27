@@ -59,3 +59,27 @@ jobs:
       - name: Vulnerability scan
         run: |
           "$(go env GOPATH)/bin/govulncheck" ./...
+
+  windows-readonly-replacement:
+    name: windows-readonly-replacement
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.7'
+          cache: true
+      - name: Verify checked-out revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Test read-only replacement and rollback
+        shell: bash
+        run: go test -count=1 ./pkg/filecollector -run '^(TestCopyCollectorOverwritesReadOnlyFile|TestRollbackAfterBackupCleanupFailure)$'

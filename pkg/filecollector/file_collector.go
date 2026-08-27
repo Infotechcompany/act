@@ -84,6 +84,21 @@ func createRootTempFile(root *os.Root) (*os.File, string, error) {
 	return nil, "", fmt.Errorf("unable to create temporary copy file")
 }
 
+func rollbackBackupCleanup(root *os.Root, tempName, destName, backupName string, cleanupErr error) error {
+	if err := root.Rename(destName, tempName); err != nil {
+		return errors.Join(cleanupErr, fmt.Errorf("move replacement aside for rollback: %w", err))
+	}
+	if restoreErr := root.Rename(backupName, destName); restoreErr != nil {
+		reinstallErr := root.Rename(tempName, destName)
+		if reinstallErr != nil {
+			return errors.Join(cleanupErr, fmt.Errorf("restore original destination: %w", restoreErr),
+				fmt.Errorf("reinstall replacement after failed rollback: %w", reinstallErr))
+		}
+		return errors.Join(cleanupErr, fmt.Errorf("restore original destination: %w", restoreErr))
+	}
+	return cleanupErr
+}
+
 func replaceRootEntry(root *os.Root, tempName, destName string) error {
 	existing, statErr := root.Lstat(destName)
 	if errors.Is(statErr, fs.ErrNotExist) {
@@ -121,12 +136,16 @@ func replaceRootEntry(root *os.Root, tempName, destName string) error {
 		return err
 	}
 	if err := root.Rename(tempName, destName); err != nil {
-		if rollbackErr := root.Rename(backupName, destName); rollbackErr != nil {
+		rollbackErr := root.Rename(backupName, destName)
+		if rollbackErr != nil {
 			return errors.Join(err, fmt.Errorf("restore original destination: %w", rollbackErr))
 		}
 		return err
 	}
-	return root.Remove(backupName)
+	if cleanupErr := root.Remove(backupName); cleanupErr != nil {
+		return rollbackBackupCleanup(root, tempName, destName, backupName, cleanupErr)
+	}
+	return nil
 }
 
 func ensureNoSymlinkParents(root *os.Root, parentName string) error {
@@ -148,6 +167,15 @@ func ensureNoSymlinkParents(root *os.Root, parentName string) error {
 		}
 	}
 	return nil
+}
+
+func hasParentPathComponent(name string) bool {
+	for _, component := range strings.FieldsFunc(name, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if component == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string, f io.Reader) error {
@@ -180,7 +208,7 @@ func (cc *CopyCollector) WriteFile(fpath string, fi fs.FileInfo, linkName string
 	destName := filepath.Base(fpath)
 	if linkName != "" {
 		if filepath.IsAbs(linkName) || filepath.VolumeName(linkName) != "" || os.IsPathSeparator(linkName[0]) ||
-			!filepath.IsLocal(filepath.Join(parentName, linkName)) {
+			hasParentPathComponent(linkName) || !filepath.IsLocal(filepath.Join(parentName, linkName)) {
 			return fmt.Errorf("symlink target %q escapes copy destination", linkName)
 		}
 		tempFile, tempName, err := createRootTempFile(parent)

@@ -3,6 +3,7 @@ package filecollector
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"net"
@@ -194,6 +195,9 @@ func TestCopyCollectorOverwritesReadOnlyFile(t *testing.T) {
 	info, err = os.Stat(destPath)
 	require.NoError(t, err)
 	assert.Equal(t, fs.FileMode(0o444), info.Mode().Perm())
+	backups, err := filepath.Glob(filepath.Join(filepath.Dir(destPath), ".act-copy-*"))
+	require.NoError(t, err)
+	assert.Empty(t, backups)
 }
 
 type fileInfoWithMode struct {
@@ -268,6 +272,8 @@ func TestCopyCollectorRejectsEscapingSymlinkTarget(t *testing.T) {
 	collector := &CopyCollector{DstDir: destDir}
 	for _, target := range []string{
 		filepath.Join("..", "..", "outside"),
+		strings.Join([]string{"a", "..", "outside"}, string(filepath.Separator)),
+		"a\\..\\outside",
 		string(filepath.Separator) + "outside",
 	} {
 		err := collector.WriteFile(filepath.Join("nested", "link"), copyCollectorSourceInfo(t), target, nil)
@@ -275,6 +281,41 @@ func TestCopyCollectorRejectsEscapingSymlinkTarget(t *testing.T) {
 		_, err = os.Lstat(filepath.Join(destDir, "nested", "link"))
 		require.ErrorIs(t, err, fs.ErrNotExist)
 	}
+}
+
+func TestCopyCollectorRejectsReverseOrderedSymlinkEscape(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+
+	// The first link is dangling at creation time. A later `a -> .` entry used
+	// to make its cleaned target resolve above DstDir.
+	require.Error(t, collector.WriteFile("b", info, strings.Join([]string{"a", "..", "outside"}, string(filepath.Separator)), nil))
+	_, err := os.Lstat(filepath.Join(destDir, "b"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	require.NoError(t, collector.WriteFile("a", info, ".", nil))
+	_, err = os.Lstat(filepath.Join(destDir, "b"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+
+	// The same invariant holds when safe aliases are created first or chained.
+	aliasFirstDir := t.TempDir()
+	aliasFirst := &CopyCollector{DstDir: aliasFirstDir}
+	require.NoError(t, aliasFirst.WriteFile("a", info, ".", nil))
+	require.NoError(t, aliasFirst.WriteFile("c", info, "a", nil))
+	require.Error(t, aliasFirst.WriteFile("b", info, strings.Join([]string{"c", "..", "outside"}, string(filepath.Separator)), nil))
+	_, err = os.Lstat(filepath.Join(aliasFirstDir, "b"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+}
+
+func TestCopyCollectorAllowsSafeForwardSymlink(t *testing.T) {
+	destDir := t.TempDir()
+	collector := &CopyCollector{DstDir: destDir}
+	info := copyCollectorSourceInfo(t)
+	require.NoError(t, collector.WriteFile("link", info, "not-created-yet", nil))
+	require.NoError(t, collector.WriteFile("not-created-yet", info, "", strings.NewReader("created later")))
+	content, err := os.ReadFile(filepath.Join(destDir, "link"))
+	require.NoError(t, err)
+	assert.Equal(t, "created later", string(content))
 }
 
 func TestCopyCollectorSanitizesModeViaOpenFile(t *testing.T) {
@@ -347,4 +388,26 @@ func TestCopyCollectorDoesNotReplaceSpecialFile(t *testing.T) {
 	info, err := os.Lstat(destPath)
 	require.NoError(t, err)
 	assert.NotZero(t, info.Mode()&fs.ModeSocket)
+}
+
+func TestRollbackAfterBackupCleanupFailure(t *testing.T) {
+	destDir := t.TempDir()
+	root, err := os.OpenRoot(destDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+	require.NoError(t, os.WriteFile(filepath.Join(destDir, "destination"), []byte("new"), 0o444))
+	require.NoError(t, os.WriteFile(filepath.Join(destDir, "backup"), []byte("old"), 0o444))
+
+	cleanupErr := errors.New("injected backup cleanup failure")
+	err = rollbackBackupCleanup(root, "temporary", "destination", "backup", cleanupErr)
+	require.ErrorIs(t, err, cleanupErr)
+	content, err := os.ReadFile(filepath.Join(destDir, "destination"))
+	require.NoError(t, err)
+	assert.Equal(t, "old", string(content))
+	restored, err := os.Stat(filepath.Join(destDir, "destination"))
+	require.NoError(t, err)
+	if runtime.GOOS != "windows" {
+		assert.Equal(t, fs.FileMode(0o444), restored.Mode().Perm())
+	}
+	require.NoError(t, root.Remove("temporary"))
 }
