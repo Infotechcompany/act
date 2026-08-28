@@ -29,6 +29,7 @@ require (
 	github.com/timshannon/bolthold v0.0.0-20240314194003-30aac6950928
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/term v0.44.0
+	golang.org/x/term v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 	gotest.tools/v3 v3.5.2
 )
